@@ -1,0 +1,118 @@
+import numpy as np
+import cv2
+import h5py
+import json
+from scipy.ndimage import uniform_filter, label as scipy_label, binary_erosion
+from skimage.filters import threshold_otsu
+from skimage.measure import regionprops
+from skimage.morphology import closing, opening, disk
+
+def find_nisar_main_path(f):
+    for band in ['LSAR', 'SSAR']:
+        path = f"science/{band}/GCOV/grids/frequencyA"
+        if path in f:
+            pols = list(f[path].keys())
+            if pols: return f"{path}/{pols[0]}"
+    return None
+
+def get_nisar_metadata(file_path):
+    with h5py.File(file_path, 'r') as f:
+        target = find_nisar_main_path(f)
+        if not target: return None
+        ds = f[target]
+        return {
+            "height": int(ds.shape[-2]), "width": int(ds.shape[-1]),
+            "spacing": float(ds.attrs.get('pixelSpacingX', 10.0)),
+            "band": "L-Band" if "LSAR" in target else "S-Band"
+        }
+
+def get_nisar_data(file_path):
+    with h5py.File(file_path, 'r') as h5_file:
+        target = find_nisar_main_path(h5_file)
+        ds = h5_file[target]
+        data = ds[0, ::6, ::6] if ds.ndim == 3 else ds[::6, ::6]
+        return np.abs(data)**2 if data.dtype in [np.complex64, np.complex128] else np.array(data, dtype=np.float32)
+
+def apply_log_scaling(intensity):
+    mask = np.isfinite(intensity) & (intensity > 0)
+    db = np.full(intensity.shape, -30.0, dtype=np.float32)
+    db[mask] = 10 * np.log10(intensity[mask])
+    db_clipped = np.clip(db, -30.0, 5.0)
+    viz = cv2.normalize(db_clipped, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    return db_clipped, viz, mask
+
+def fuse_nisar_bands(file_l, file_s, method="PCA"):
+    data_l = get_nisar_data(file_l); data_s = get_nisar_data(file_s)
+    if data_l.shape != data_s.shape:
+        data_s = cv2.resize(data_s, (data_l.shape[1], data_l.shape[0]), interpolation=cv2.INTER_LINEAR)
+    db_l, _, m_l = apply_log_scaling(data_l); db_s, _, m_s = apply_log_scaling(data_s)
+    fused_mask = m_l & m_s
+    if method == "PCA":
+        l_flat = cv2.normalize(db_l, None, 0, 1, cv2.NORM_MINMAX).flatten()
+        s_flat = cv2.normalize(db_s, None, 0, 1, cv2.NORM_MINMAX).flatten()
+        X = np.vstack((l_flat, s_flat)); cov = np.cov(X); val, vec = np.linalg.eig(cov)
+        w = vec[:, np.argmax(val)]; w = w / np.sum(w)
+        fused_db = (w[0] * db_l) + (w[1] * db_s)
+    else: fused_db = (db_l + db_s) / 2.0
+    viz = cv2.normalize(np.clip(fused_db, -30.0, 5.0), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    return fused_db, viz, fused_mask
+
+def run_speckle_filter(img, method):
+    if method == "Lee Filter":
+        m = uniform_filter(img, 5); v = uniform_filter(img**2, 5) - m**2
+        w = v / (v + np.var(img) + 1e-5); res = m + w * (img - m)
+    elif method == "Kuan Filter":
+        m = uniform_filter(img, 5); v = uniform_filter(img**2, 5) - m**2
+        ci = v / (m**2 + 1e-5); w = np.clip((1 - 0.06/(ci+1e-5))/1.06, 0, 1); res = m + w * (img - m)
+    else: res = cv2.medianBlur(img.astype(np.float32), 5)
+    viz = cv2.normalize(res, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    enl = round(float((np.mean(res)/(np.std(res)+1e-5))**2), 2)
+    return res, viz, enl
+
+def run_segmentation(img, method, mask, manual_t=None):
+    if manual_t is not None:
+        t_val = manual_t
+    elif method == "K-Means Clustering":
+        pixel_values = img[mask].reshape((-1, 1))
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _, labels, centers = cv2.kmeans(pixel_values.astype(np.float32), 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+        t_val = np.mean(centers)
+    else: # Otsu Default
+        t_val = threshold_otsu(img[mask])
+    
+    bin_img = (img < t_val) & mask
+    if np.sum(bin_img) > np.sum(mask) * 0.6: bin_img = ~bin_img & mask
+    return bin_img.astype(np.uint8)*255, round(float(t_val), 2)
+
+def run_refinement(binary, r_list, spacing, swath_mask, raw_db, morph_val=21):
+    bin_u8 = (binary > 0).astype(np.uint8) * 255
+    res = cv2.morphologyEx(bin_u8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_val, morph_val)))
+    lab, num = scipy_label(res > 0)
+    if num == 0: return np.zeros_like(binary), {"KM":0, "Area":0}, bin_u8
+    ocean_mask = (lab == max(regionprops(lab), key=lambda r: r.area).label).astype(np.uint8)*255
+    purified = opening(closing(ocean_mask > 0, disk(3)), disk(11))
+    edges = cv2.Canny(purified.astype(np.uint8)*255, 100, 200)
+    m_mask = binary_erosion(swath_mask, structure=np.ones((40, 40)))
+    clean_edges = cv2.bitwise_and(edges, edges, mask=m_mask.astype(np.uint8))
+    cnts, _ = cv2.findContours(clean_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    final_canvas = np.zeros_like(edges); total_km = 0
+    if cnts:
+        main_cnt = max(cnts, key=lambda c: cv2.arcLength(c, False))
+        if "Douglas-Peuker" in r_list:
+            epsilon = 0.0015 * cv2.arcLength(main_cnt, True)
+            main_cnt = cv2.approxPolyDP(main_cnt, epsilon, False)
+        total_km = (cv2.arcLength(main_cnt, False) * spacing) / 1500.0
+        cv2.drawContours(final_canvas, [main_cnt], -1, 255, 1)
+    area = round((np.sum(purified > 0) * (spacing**2)) / 1e6, 2)
+    return final_canvas, {"KM": round(total_km, 2), "Area": area}, purified.astype(np.uint8)*255
+
+def calculate_change(m1, m2, sp):
+    er = (m1 > 0) & (m2 == 0); ac = (m1 == 0) & (m2 > 0)
+    return round(np.sum(er)*(sp**2)/1e6, 4), round(np.sum(ac)*(sp**2)/1e6, 4)
+
+def export_geojson(edges):
+    cnts, _ = cv2.findContours(edges.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return ""
+    main_cnt = max(cnts, key=lambda c: cv2.arcLength(c, False))
+    coords = [[float(p[0][0]), float(p[0][1])] for p in main_cnt]
+    return json.dumps({"type": "FeatureCollection", "features": [{"type": "Feature", "geometry": {"type": "LineString", "coordinates": coords}}]})
