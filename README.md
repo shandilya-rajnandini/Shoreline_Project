@@ -44,3 +44,15 @@ The framework's **Purified Analytics Matrix** delivers sub-pixel precision acros
 - **Positional Accuracy:** achieves an RMSE of ñ8-14 meters compared against optical validation sets. 
 - **Noise Reduction:** Connected Component Analysis (CCA) reduces the false-positive land misclassification rate to under 2.5%. 
 - **Vector Optimization:** Douglas-Peucker algorithmic compression compresses redundant polyline vertices by approximately 65% for immediate GIS portability. 
+ 
+## ?? Project Documentation & Publications 
+ 
+Read the full detailed machine learning framework, system architecture, and validation protocol here: 
+- [Download Research Paper PDF](./NISAR_Shoreline_Extraction_Paper.pdf) 
+ 
+## ?? Connect and Reach Me 
+ 
+If you are interested in my work on radar remote sensing, machine learning, or coastal monitoring frameworks, feel free to connect! 
+- **Email:** singhrajnandini708@gmail.com 
+- **GitHub Profile:** [shandilya-rajnandini](https://github.com/shandilya-rajnandini) 
+- **Institution:** Department of Computer Science and Engineering, IIT Patna 
